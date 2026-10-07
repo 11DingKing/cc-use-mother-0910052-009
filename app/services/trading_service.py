@@ -18,6 +18,7 @@ from app.trading.base import (
 from app.trading.simulation_adapter import SimulationAdapter
 from app.trading.vnpy_adapter import VnpyAdapter
 from app.services.analysis_service import AnalysisService
+from app.services.settlement_service import SettlementService
 from app.middleware.exception_handler import AppException
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class TradingService:
         self.adapter = adapter or SimulationAdapter()
         self.risk_manager = RiskManager()
         self.analysis_service = AnalysisService()
+        self.settlement = SettlementService()
         self._auto_trade_enabled = False
     
     def connect(self, adapter_type: str = "simulation", config: Optional[Dict] = None) -> bool:
@@ -236,7 +238,116 @@ class TradingService:
         if not quote:
             raise TradingException("无法获取行情数据", stock_code=stock_code)
         return quote
-    
+
+    # ------------------------------------------------------------------
+    # 日终结算
+    # ------------------------------------------------------------------
+
+    def run_settlement(
+        self,
+        trade_date: str,
+        quotes: Optional[Dict[str, Any]] = None,
+        corporate_actions: Optional[List[Dict[str, Any]]] = None,
+        fees: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """执行（或断点续办）指定交易日的唯一结算批次。"""
+        return self.settlement.run_settlement(
+            adapter=self.adapter,
+            trade_date=trade_date,
+            quotes=quotes,
+            corporate_actions=corporate_actions,
+            fees=fees,
+        )
+
+    def get_account_view(
+        self,
+        trade_date: Optional[str] = None,
+        quotes: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """权益视图：自动区分临时估值（provisional）与已封账（sealed）。"""
+        return self.settlement.get_account_view(
+            adapter=self.adapter, trade_date=trade_date, quotes=quotes
+        )
+
+    def provisional_valuation(
+        self,
+        trade_date: Optional[str] = None,
+        quotes: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """显式请求临时估值（永不入账、永不封账）。"""
+        return self.settlement.provisional_valuation(
+            adapter=self.adapter, trade_date=trade_date, quotes=quotes
+        )
+
+    def get_settlement(self, trade_date: str) -> Optional[Dict[str, Any]]:
+        """查询某交易日封账结果（含批次号与来源）。"""
+        account = self.adapter.get_account()
+        if not account:
+            raise TradingException("无法获取账户信息，请检查交易连接")
+        return self.settlement.get_settlement(account.account_id, trade_date)
+
+    def list_settlements(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """历史结算批次列表。"""
+        account = self.adapter.get_account()
+        if not account:
+            raise TradingException("无法获取账户信息，请检查交易连接")
+        return self.settlement.list_settlements(
+            account.account_id, start_date, end_date, limit
+        )
+
+    def get_settlement_positions(self, trade_date: str) -> List[Dict[str, Any]]:
+        """查询某交易日封账持仓快照。"""
+        account = self.adapter.get_account()
+        if not account:
+            raise TradingException("无法获取账户信息，请检查交易连接")
+        return self.settlement.get_settlement_positions(account.account_id, trade_date)
+
+    def get_settlement_ledger(self, trade_date: str) -> List[Dict[str, Any]]:
+        """查询某交易日分类账流水（审计用）。"""
+        account = self.adapter.get_account()
+        if not account:
+            raise TradingException("无法获取账户信息，请检查交易连接")
+        return self.settlement.get_ledger(account.account_id, trade_date)
+
+    def record_late_trade(self, trade: Dict[str, Any]) -> Dict[str, Any]:
+        """登记封账后迟到的成交（挂起，下一交易日补入一次）。"""
+        account = self.adapter.get_account()
+        payload = dict(trade)
+        if account and not payload.get("account_id"):
+            payload["account_id"] = account.account_id
+        return self.settlement.record_late_trade(payload)
+
+    def get_carry_forward(self) -> Dict[str, Any]:
+        """下一交易日续办信息：结转未完成订单与待补迟到成交。"""
+        account = self.adapter.get_account()
+        if not account:
+            raise TradingException("无法获取账户信息，请检查交易连接")
+        return self.settlement.get_carry_forward(account.account_id)
+
+    def restore_latest_settlement(self) -> Optional[Dict[str, Any]]:
+        """进程重启后从最近封账批次恢复账户内存状态。
+
+        返回恢复所用批次；无封账历史时返回 None。
+        """
+        account = self.adapter.get_account()
+        if not account:
+            raise TradingException("无法获取账户信息，请检查交易连接")
+        latest = self.settlement.list_settlements(account.account_id, limit=1)
+        if not latest or latest[0]["status"] != "sealed":
+            return None
+        result = self.settlement.get_settlement(
+            account.account_id, latest[0]["trade_date"]
+        )
+        restore = getattr(self.adapter, "restore_from_settlement", None)
+        if restore is not None:
+            restore(result)
+        return result
+
     def execute_signal(
         self,
         stock_code: str,

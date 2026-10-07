@@ -49,6 +49,7 @@ class Order:
     status: OrderStatus = OrderStatus.PENDING
     filled_quantity: int = 0
     filled_price: Optional[Decimal] = None
+    filled_at: Optional[datetime] = None
     commission: Decimal = Decimal("0")
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
@@ -71,6 +72,7 @@ class Order:
             "status": self.status.value,
             "filled_quantity": self.filled_quantity,
             "filled_price": float(self.filled_price) if self.filled_price else None,
+            "filled_at": self.filled_at.isoformat() if self.filled_at else None,
             "commission": float(self.commission),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),

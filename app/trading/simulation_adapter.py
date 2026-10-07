@@ -26,9 +26,16 @@ class SimulationAdapter(TradingAdapter):
         
         # 初始资金
         initial_cash = Decimal(str(config.get("initial_cash", 1000000))) if config else Decimal("1000000")
-        
+
+        # 账户标识可配置：固定 account_id 使日终封账状态在进程重启后可恢复
+        account_id = (
+            str(config["account_id"])
+            if config and config.get("account_id")
+            else "SIM_" + datetime.now().strftime("%Y%m%d%H%M%S")
+        )
+
         self._account = Account(
-            account_id="SIM_" + datetime.now().strftime("%Y%m%d%H%M%S"),
+            account_id=account_id,
             broker="模拟交易",
             total_assets=initial_cash,
             available_cash=initial_cash,
@@ -64,6 +71,48 @@ class SimulationAdapter(TradingAdapter):
         """业务模块说明。"""
         self._connected = False
         logger.info("Simulation adapter disconnected")
+
+    def restore_from_settlement(self, sealed_result: Dict) -> None:
+        """从已封账批次恢复账户内存状态（进程重启后续办）。
+
+        以封账数字为唯一权威：恢复现金、跨日持仓（收盘价、次日可卖数量），
+        历史订单簿不在内存重建（结算重放只依赖持久化快照与分类账）。
+        """
+        account = sealed_result["account"]
+        next_day = sealed_result.get("next_day", {})
+        self._account.total_assets = Decimal(str(account["total_assets"]))
+        # 封账现金恢复为可用资金，结转未完成买单冻结额单列；
+        # 下一交易日可买额度 = available_cash - frozen_cash
+        self._account.available_cash = Decimal(str(account["cash"]))
+        self._account.frozen_cash = Decimal(
+            str(next_day.get("frozen_cash", 0))
+        )
+        self._account.market_value = Decimal(str(account["market_value"]))
+        self._account.profit_loss = Decimal(str(account.get("unrealized_pnl", 0)))
+        self._positions = {}
+        for p in sealed_result.get("positions", []):
+            price = Decimal(str(p["close_price"]))
+            qty = int(p["quantity"])
+            self._positions[p["stock_code"]] = Position(
+                stock_code=p["stock_code"],
+                stock_name=p.get("stock_name") or p["stock_code"],
+                quantity=qty,
+                available_quantity=int(p.get("available_quantity", qty)),
+                avg_cost=Decimal(str(p["avg_cost"])),
+                current_price=price,
+                market_value=Decimal(str(p["market_value"])),
+                profit_loss=Decimal(str(p["unrealized_pnl"])),
+                profit_loss_ratio=float(
+                    (price - Decimal(str(p["avg_cost"])))
+                    / Decimal(str(p["avg_cost"]))
+                ) if Decimal(str(p["avg_cost"])) > 0 else 0.0,
+            )
+        logger.info(
+            "已从封账批次 %s 恢复账户 %s：%d 笔持仓",
+            sealed_result.get("batch_no"),
+            self._account.account_id,
+            len(self._positions),
+        )
     
     def get_account(self) -> Optional[Account]:
         """业务模块说明。"""
@@ -146,6 +195,7 @@ class SimulationAdapter(TradingAdapter):
         order.status = OrderStatus.FILLED
         order.filled_quantity = order.quantity
         order.filled_price = fill_price
+        order.filled_at = datetime.now()
         order.updated_at = datetime.now()
         
         # 计算手续费
@@ -293,8 +343,7 @@ class SimulationAdapter(TradingAdapter):
     
     def set_quote(self, stock_code: str, price: float) -> None:
         """业务模块说明。"""
-        self._quotes[stock_code] = {
-            "stock_code": stock_code,
+        self._quotes[stock_code] = {            "stock_code": stock_code,
             "last_price": price,
             "open": price,
             "high": price * 1.02,
