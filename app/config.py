@@ -71,14 +71,17 @@ def init_database():
     from app.entities.analysis_result import Base as AnalysisBase
     from app.entities.watchlist import Base as WatchlistBase
     from app.entities.backtest import Base as BacktestBase
-    
+    from app.mappers.settlement_mapper import create_settlement_tables
+
     engine = get_engine()
-    
+
     # 创建所有表
     StockBase.metadata.create_all(bind=engine)
     AnalysisBase.metadata.create_all(bind=engine)
     WatchlistBase.metadata.create_all(bind=engine)
     BacktestBase.metadata.create_all(bind=engine)
+    # 日终结算相关表（幂等创建）
+    create_settlement_tables(engine)
 
 # 数据源配置
 DATA_SOURCE_CONFIG = {

@@ -18,6 +18,7 @@ from app.trading.base import (
 from app.trading.simulation_adapter import SimulationAdapter
 from app.trading.vnpy_adapter import VnpyAdapter
 from app.services.analysis_service import AnalysisService
+from app.services.settlement_service import SettlementService
 from app.middleware.exception_handler import AppException
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,8 @@ class TradingService:
         self.adapter = adapter or SimulationAdapter()
         self.risk_manager = RiskManager()
         self.analysis_service = AnalysisService()
+        self.settlement_service = SettlementService()
+        self._settlement_storage_ready = False
         self._auto_trade_enabled = False
     
     def connect(self, adapter_type: str = "simulation", config: Optional[Dict] = None) -> bool:
@@ -298,7 +301,7 @@ class TradingService:
         """业务模块说明。"""
         results = []
         positions = self.adapter.get_positions()
-        
+
         for pos in positions:
             if self.risk_manager.check_stop_loss(pos):
                 # 触发止损
@@ -316,7 +319,7 @@ class TradingService:
                         results.append(result)
                     except TradingException as e:
                         logger.error(f"Stop loss failed: {e}")
-            
+
             elif self.risk_manager.check_take_profit(pos):
                 # 触发止盈
                 quote = self.adapter.get_quote(pos.stock_code)
@@ -333,5 +336,140 @@ class TradingService:
                         results.append(result)
                     except TradingException as e:
                         logger.error(f"Take profit failed: {e}")
-        
+
         return results
+
+    # ------------------------------------------------------------------
+    # 日终结算
+    # ------------------------------------------------------------------
+
+    def _ensure_settlement_storage(self) -> None:
+        if not self._settlement_storage_ready:
+            self.settlement_service.init_storage()
+            self._settlement_storage_ready = True
+
+    def run_settlement(
+        self,
+        trade_date: str,
+        closing_prices: Optional[Dict[str, float]] = None,
+        next_trading_date: Optional[str] = None,
+        initial_cash: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """执行或续办日终结算（同一交易日重复调用幂等）。"""
+        self._ensure_settlement_storage()
+        return self.settlement_service.run_settlement(
+            adapter=self.adapter,
+            trade_date=trade_date,
+            closing_prices=closing_prices,
+            next_trading_date=next_trading_date,
+            initial_cash=initial_cash,
+        )
+
+    def get_settlement(
+        self, trade_date: str, include_orders: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """查询某交易日的结算批次（含未完成批次）。"""
+        self._ensure_settlement_storage()
+        account_id = self.settlement_service._account_id(self.adapter)
+        return self.settlement_service.get_settlement(
+            account_id, trade_date, include_orders=include_orders
+        )
+
+    def list_settlements(
+        self, status: Optional[str] = None, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """历史结算批次查询。"""
+        self._ensure_settlement_storage()
+        account_id = self.settlement_service._account_id(self.adapter)
+        return self.settlement_service.list_settlements(
+            account_id=account_id, status=status, limit=limit
+        )
+
+    def get_account_view(self, trade_date: str) -> Dict[str, Any]:
+        """权益视图：已封账返回封账数字，否则返回临时估值，并标注来源。"""
+        self._ensure_settlement_storage()
+        return self.settlement_service.get_account_view(
+            adapter=self.adapter, trade_date=trade_date
+        )
+
+    def get_valuation(
+        self,
+        trade_date: Optional[str] = None,
+        quotes: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """临时估值（不封账、不落库）。"""
+        return self.settlement_service.get_valuation(
+            adapter=self.adapter, trade_date=trade_date, quotes=quotes
+        )
+
+    def record_late_fill(
+        self,
+        trade_date: str,
+        order_id: str,
+        stock_code: str,
+        side: str,
+        quantity: int,
+        filled_price: float,
+        stock_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """登记封账后到达的迟到成交（不改历史，由后续交易日批次消费）。"""
+        self._ensure_settlement_storage()
+        account_id = self.settlement_service._account_id(self.adapter)
+        return self.settlement_service.record_late_fill(
+            account_id=account_id,
+            trade_date=trade_date,
+            order_id=order_id,
+            stock_code=stock_code,
+            side=side,
+            quantity=quantity,
+            filled_price=filled_price,
+            stock_name=stock_name,
+        )
+
+    def register_restatement(
+        self,
+        trade_date: str,
+        reason: str,
+        corrected_quotes: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """登记重新估值请求（已封账数字不可变，仅 rejected 留痕）。"""
+        self._ensure_settlement_storage()
+        account_id = self.settlement_service._account_id(self.adapter)
+        return self.settlement_service.register_restatement(
+            account_id=account_id,
+            trade_date=trade_date,
+            reason=reason,
+            corrected_quotes=corrected_quotes,
+        )
+
+    def register_corporate_action(
+        self,
+        stock_code: str,
+        action_type: str,
+        ex_date: str,
+        ratio: float = 0.0,
+        cash_per_share: float = 0.0,
+    ) -> Dict[str, Any]:
+        """登记企业行动（分红/送股/拆股），由除权日批次幂等消费。"""
+        self._ensure_settlement_storage()
+        account_id = self.settlement_service._account_id(self.adapter)
+        return self.settlement_service.register_corporate_action(
+            account_id=account_id,
+            stock_code=stock_code,
+            action_type=action_type,
+            ex_date=ex_date,
+            ratio=ratio,
+            cash_per_share=cash_per_share,
+        )
+
+    def list_post_seal_adjustments(
+        self,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询封账后调整（迟到成交/重新估值）。"""
+        self._ensure_settlement_storage()
+        account_id = self.settlement_service._account_id(self.adapter)
+        return self.settlement_service.list_adjustments(
+            account_id=account_id, trade_date=trade_date, status=status
+        )

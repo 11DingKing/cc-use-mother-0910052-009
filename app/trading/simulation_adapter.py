@@ -26,9 +26,15 @@ class SimulationAdapter(TradingAdapter):
         
         # 初始资金
         initial_cash = Decimal(str(config.get("initial_cash", 1000000))) if config else Decimal("1000000")
-        
+        # 账户标识：优先使用显式配置，保证重启后续接同一结算账户
+        account_id = (
+            str(config.get("account_id"))
+            if config and config.get("account_id")
+            else "SIM_" + datetime.now().strftime("%Y%m%d%H%M%S")
+        )
+
         self._account = Account(
-            account_id="SIM_" + datetime.now().strftime("%Y%m%d%H%M%S"),
+            account_id=account_id,
             broker="模拟交易",
             total_assets=initial_cash,
             available_cash=initial_cash,
